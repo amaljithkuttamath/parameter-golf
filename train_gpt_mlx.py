@@ -80,6 +80,8 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    value_residual: bool = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    gated_attention: bool = bool(int(os.environ.get("GATED_ATTENTION", "0")))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -293,10 +295,6 @@ class RMSNormNoWeight(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    # - separate q/k/v projections
-    # - RMSNorm on q and k before attention
-    # - RoPE on q and k
-    # - causal masked SDPA
     def __init__(
         self,
         dim: int,
@@ -304,6 +302,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        value_residual: bool = False,
+        gated_attention: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -323,19 +323,36 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+        self._value_residual = value_residual
+        if value_residual:
+            self.vr_lambda = mx.array([0.5, 0.5], dtype=mx.float32)
+        self._gated_attention = gated_attention
+        if gated_attention:
+            self.attn_gate_w = mx.zeros((num_heads, dim), dtype=mx.float32)
+            self.attn_gate_b = mx.ones((num_heads,), dtype=mx.float32) * 4.0
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, v0: mx.array | None = None) -> tuple[mx.array, mx.array | None]:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
+        raw_v = v if self._value_residual else None
+        if self._value_residual and v0 is not None:
+            lam = self.vr_lambda.astype(v.dtype)
+            v = lam[0] * v0 + lam[1] * v
+
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+
+        if self._gated_attention:
+            gate = mx.sigmoid(x @ self.attn_gate_w.astype(x.dtype).T + self.attn_gate_b.astype(x.dtype))
+            y = y * gate.transpose(0, 2, 1)[:, :, :, None]
+
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y), raw_v
 
 
 class MLP(nn.Module):
@@ -360,23 +377,26 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        value_residual: bool = False,
+        gated_attention: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        value_residual=value_residual, gated_attention=gated_attention)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, v0: mx.array | None = None) -> tuple[mx.array, mx.array | None]:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out, raw_v = self.attn(self.attn_norm(x), v0=v0)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        return x, raw_v
 
 
 class GPT(nn.Module):
@@ -386,7 +406,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, value_residual: bool = False, gated_attention: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -399,7 +419,8 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                  value_residual=value_residual, gated_attention=gated_attention)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -418,18 +439,18 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
+        v0 = None
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x, raw_v = self.blocks[i](x, x0, v0=v0)
+            if v0 is None and raw_v is not None:
+                v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x, _ = self.blocks[self.num_encoder_layers + i](x, x0, v0=v0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -552,6 +573,37 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
+HADAMARD_QUANT = bool(int(os.environ.get("HADAMARD_QUANT", "0")))
+
+def _hadamard_matrix(n: int) -> np.ndarray:
+    """Generate a normalized Hadamard matrix of size n (must be power of 2)."""
+    if n == 1:
+        return np.array([[1.0]], dtype=np.float32)
+    half = _hadamard_matrix(n // 2)
+    h = np.block([[half, half], [half, -half]])
+    return h
+
+def _next_power_of_2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+def hadamard_rotate(w: np.ndarray) -> tuple[np.ndarray, int]:
+    """Rotate columns of a 2D weight matrix by Hadamard transform.
+    Pads to next power of 2 if needed. Returns rotated matrix and original col count."""
+    rows, cols = w.shape
+    orig_cols = cols
+    p2 = _next_power_of_2(cols)
+    if p2 != cols:
+        w = np.pad(w, ((0, 0), (0, p2 - cols)), mode='constant')
+    H = _hadamard_matrix(p2) / np.sqrt(p2)
+    return (w @ H).astype(np.float32), orig_cols
+
+def hadamard_unrotate(w: np.ndarray, orig_cols: int) -> np.ndarray:
+    """Undo Hadamard rotation. H is its own inverse (symmetric orthogonal)."""
+    cols = w.shape[1]
+    H = _hadamard_matrix(cols) / np.sqrt(cols)
+    w = (w @ H)[:, :orig_cols]
+    return w.astype(np.float32)
+
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
 INT8_PER_ROW_SCALE_DTYPE = np.float16
@@ -572,13 +624,16 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+def quantize_float_array(arr: mx.array, had_meta: dict | None = None, name: str = "") -> tuple[np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
     if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
-        clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
+        w = f32
+        if HADAMARD_QUANT and f32.size > INT8_KEEP_FLOAT_MAX_NUMEL:
+            w, orig_cols = hadamard_rotate(f32)
+            if had_meta is not None:
+                had_meta[name] = orig_cols
+        clip_abs = np.quantile(np.abs(w), INT8_CLIP_Q, axis=1) if w.size else np.empty((w.shape[0],), dtype=np.float32)
+        clipped = np.clip(w, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
         q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
         return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
@@ -597,6 +652,7 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
     passthrough: dict[str, np.ndarray] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
+    had_meta: dict[str, int] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
@@ -620,7 +676,7 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
+        q, s = quantize_float_array(arr, had_meta=had_meta, name=name)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -638,22 +694,26 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
         obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    if had_meta:
+        obj["had_meta"] = had_meta
     return obj, stats
 
 
 def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.array]:
     out: dict[str, mx.array] = {}
     qmeta = quant_obj.get("qmeta", {})
+    had_meta = quant_obj.get("had_meta", {})
     passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
     for name, q in quant_obj["quantized"].items():
         q_np = np.asarray(q, dtype=np.int8)
         dtype_name = quant_obj["dtypes"][name]
         scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
         if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
             out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
+        if name in had_meta:
+            out_arr = hadamard_unrotate(out_arr, had_meta[name])
         out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
     for name, arr in quant_obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
@@ -897,6 +957,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        value_residual=args.value_residual,
+        gated_attention=args.gated_attention,
     )
     opt = SplitOptimizers(model, args)
 
